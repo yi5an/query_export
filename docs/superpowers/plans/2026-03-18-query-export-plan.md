@@ -1003,7 +1003,113 @@ class Datasource(DatasourceBase):
         fields = {'password': {'exclude': True}}
 ```
 
-- [ ] **Step 3: 提交**
+- [ ] **Step 3: 创建 SQL 导出处理器**
+
+```python
+# backend/app/services/export/sql_handler.py
+from typing import List, Any
+from pathlib import Path
+
+
+class SQLHandler:
+    """SQL INSERT 语句导出处理器"""
+
+    def __init__(self, table_name: str = "exported_data"):
+        self.table_name = table_name
+
+    async def write(
+        self,
+        columns: List[str],
+        rows: List[List[Any]],
+        output_path: str
+    ) -> int:
+        """
+        写入 SQL INSERT 文件
+        返回写入的行数
+        """
+        output_file = Path(output_path)
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(output_file, 'w', encoding='utf-8') as f:
+            for row in rows:
+                # 转义值
+                values = []
+                for value in row:
+                    if value is None:
+                        values.append("NULL")
+                    elif isinstance(value, str):
+                        # 转义单引号
+                        escaped = value.replace("'", "''")
+                        values.append(f"'{escaped}'")
+                    elif isinstance(value, (int, float)):
+                        values.append(str(value))
+                    else:
+                        values.append(f"'{str(value)}'")
+
+                column_list = ", ".join(columns)
+                value_list = ", ".join(values)
+                sql = f"INSERT INTO {self.table_name} ({column_list}) VALUES ({value_list});\n"
+                f.write(sql)
+
+        return len(rows)
+
+    @staticmethod
+    def get_content_type() -> str:
+        return "text/plain"
+
+    @staticmethod
+    def get_extension() -> str:
+        return ".sql"
+```
+
+- [ ] **Step 4: 创建 JSON 导出处理器**
+
+```python
+# backend/app/services/export/json_handler.py
+import json
+from typing import List, Any
+from pathlib import Path
+
+
+class JSONHandler:
+    """JSON 导出处理器"""
+
+    @staticmethod
+    async def write(
+        columns: List[str],
+        rows: List[List[Any]],
+        output_path: str
+    ) -> int:
+        """
+        写入 JSON 文件
+        返回写入的行数
+        """
+        output_file = Path(output_path)
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # 转换为字典列表
+        data = []
+        for row in rows:
+            row_dict = {}
+            for i, col_name in enumerate(columns):
+                row_dict[col_name] = row[i] if i < len(row) else None
+            data.append(row_dict)
+
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+        return len(rows)
+
+    @staticmethod
+    def get_content_type() -> str:
+        return "application/json"
+
+    @staticmethod
+    def get_extension() -> str:
+        return ".json"
+```
+
+- [ ] **Step 5: 提交
 
 ```bash
 git add backend/app/api/v1/datasources.py backend/app/schemas/datasource.py
@@ -1122,8 +1228,8 @@ async def execute_query_api(
 
         execution_time = (time.time() - start_time) * 1000
 
-        # 更新 SQL 运行次数（如果是保存的 SQL）
-        # TODO: 后续实现
+        # 注: SQL 运行次数更新功能将在阶段 7 (SQL 保存管理) 中实现
+        # 当保存的 SQL 被执行时，会更新其 run_count 和 last_run_at 字段
 
         return QueryResponse(
             columns=query_result["columns"],
@@ -1899,11 +2005,15 @@ from typing import List, Any, AsyncIterator
 from backend.app.services.connector.factory import get_connector
 from backend.app.services.export.csv_handler import CSVHandler
 from backend.app.services.export.excel_handler import ExcelHandler
+from backend.app.services.export.sql_handler import SQLHandler
+from backend.app.services.export.json_handler import JSONHandler
 from backend.app.core.security import decrypt_password
 
 EXPORT_HANDLERS = {
     "csv": CSVHandler,
     "excel": ExcelHandler,
+    "sql": SQLHandler,
+    "json": JSONHandler,
 }
 
 
@@ -2177,31 +2287,102 @@ git commit -m "feat: add export API with background tasks"
 
 ---
 
-## 后续阶段（简要列出）
+## Phase 2: 完整功能（后续阶段）
+
+**说明**: 以下阶段将在完成 MVP（阶段 1-5）后，根据实际使用反馈进行详细规划。每个阶段将包含完整的任务分解、实现步骤和验证方法。
 
 ### 阶段 6: 更多数据源连接器
-- ClickHouse 连接器
-- Doris 连接器
-- Redis 连接器
-- Elasticsearch 连接器
-- MinIO 连接器
+
+基于 PostgreSQL 连接器的实现模式，依次添加：
+
+1. **ClickHouse 连接器**
+   - 实现 BaseConnector 接口
+   - 使用 clickhouse-connect 驱动
+   - 支持查询和流式导出
+   - 导出格式: CSV, Excel, SQL
+
+2. **Doris 连接器**
+   - 实现 BaseConnector 接口
+   - 使用 MySQL 协议驱动
+   - 支持查询和流式导出
+   - 导出格式: CSV, Excel, SQL
+
+3. **Redis 连接器**
+   - 实现 BaseConnector 接口
+   - 支持单机和集群模式
+   - 命令执行和结果解析
+   - 导出格式: CSV, Excel
+
+4. **Elasticsearch 连接器**
+   - 实现 BaseConnector 接口
+   - 支持 Query DSL 查询
+   - JSON 格式原生支持
+   - 导出格式: CSV, Excel, JSON
+
+5. **MinIO 连接器**
+   - 实现 BaseConnector 接口
+   - 列出 bucket 和对象
+   - 支持文件直接下载
+   - 导出格式: 文件
 
 ### 阶段 7: SQL 保存管理
-- 保存/加载 SQL API
-- 前端 SQL 列表组件
-- 标签管理
+
+1. **后端 API 实现**
+   - GET /api/v1/saved-sqls - 列表查询（支持搜索、标签筛选）
+   - POST /api/v1/saved-sqls - 保存 SQL
+   - PUT /api/v1/saved-sqls/{id} - 更新 SQL
+   - DELETE /api/v1/saved-sqls/{id} - 删除 SQL
+   - 保存时生成 comment 的 embedding 向量
+
+2. **前端组件**
+   - SavedSqlList.vue - SQL 列表页面
+   - 保存 SQL 弹窗（名称、注释、标签输入）
+   - SQL 快速加载功能
+   - 标签过滤和搜索
 
 ### 阶段 8: AI 功能
-- AI Provider 抽象
-- OpenAI/Claude/Ollama 实现
-- 向量化与语义匹配
-- AI 对话组件
+
+1. **AI Provider 抽象层**
+   - BaseAIProvider 接口定义
+   - generate_embedding() 方法
+   - generate_sql() 方法
+
+2. **支持的 AI 后端**
+   - OpenAIProvider (GPT-4)
+   - ClaudeProvider (Anthropic)
+   - OllamaProvider (本地模型)
+
+3. **语义匹配与 SQL 生成**
+   - 用户描述向量化
+   - 在 saved_sqls 中进行语义相似搜索
+   - 使用相似 SQL 作为示例生成新 SQL
+
+4. **前端 AI 对话组件**
+   - AiChat.vue 组件
+   - 对话历史显示
+   - SQL 建议接受/编辑功能
 
 ### 阶段 9: 完善与优化
-- 单元测试
-- 错误处理
-- 性能优化
-- 文档完善
+
+1. **测试覆盖**
+   - 单元测试 (pytest)
+   - API 集成测试
+   - 前端组件测试
+
+2. **错误处理**
+   - 统一错误响应格式
+   - 友好的错误提示
+   - 错误日志记录
+
+3. **性能优化**
+   - 真正的流式导出（避免全量加载到内存）
+   - 查询结果缓存
+   - 前端虚拟滚动优化
+
+4. **文档与部署**
+   - API 使用文档
+   - 部署指南
+   - 故障排查手册
 
 ---
 
