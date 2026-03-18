@@ -38,6 +38,25 @@ pydantic-settings>=2.1.0
 cryptography>=42.0.0
 python-dotenv>=1.0.0
 aiofiles>=23.2.0
+
+# 数据库驱动
+pgvector>=0.2.0
+psycopg2-binary>=2.9.9
+clickhouse-connect>=0.6.0
+mysql-connector-python>=8.0.0
+redis>=5.0.0
+elasticsearch>=8.12.0
+minio>=7.2.0
+
+# 导出处理
+openpyxl>=3.1.0
+xlsxwriter>=3.1.9
+
+# AI 相关
+httpx>=0.26.0
+
+# SQL 处理
+sqlparse>=0.4.0
 ```
 
 - [ ] **Step 2: 创建配置模块**
@@ -183,9 +202,10 @@ class Datasource(Base):
 
 ```python
 # backend/app/models/saved_sql.py
-from sqlalchemy import Column, Integer, String, Text, DateTime, Array, BigInteger
+from sqlalchemy import Column, Integer, String, Text, DateTime, Array
 from sqlalchemy.sql import func
 from sqlalchemy import ForeignKey
+from pgvector.sqlalchemy import Vector
 from backend.app.core.database import Base
 
 
@@ -198,7 +218,7 @@ class SavedSql(Base):
     sql_text = Column(Text, nullable=False)
     comment = Column(Text)  # 用于 AI 语义匹配
     tags = Column(Array(String))  # 标签数组
-    embedding = Column(BigInteger)  # 向量存储（后续添加 pgvector）
+    embedding = Column(Vector(1536))  # pgvector 向量存储
     run_count = Column(Integer, default=0)
     last_run_at = Column(DateTime(timezone=True))
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -342,9 +362,13 @@ alembic revision --autogenerate -m "Initial migration"
 ```python
 from alembic import op
 import sqlalchemy as sa
+from pgvector.sqlalchemy import Vector
 
 
 def upgrade():
+    # 创建 pgvector 扩展
+    op.execute('CREATE EXTENSION IF NOT EXISTS vector')
+
     # 创建数据源表
     op.create_table(
         'datasources',
@@ -365,7 +389,7 @@ def upgrade():
     op.create_index(op.f('ix_datasources_id'), 'datasources', ['id'], unique=False)
     op.create_index(op.f('ix_datasources_name'), 'datasources', ['name'], unique=True)
 
-    # 创建保存的 SQL 表（不含 embedding，后续手动添加）
+    # 创建保存的 SQL 表，包含 embedding 列
     op.create_table(
         'saved_sqls',
         sa.Column('id', sa.Integer(), nullable=False),
@@ -374,14 +398,17 @@ def upgrade():
         sa.Column('sql_text', sa.Text(), nullable=False),
         sa.Column('comment', sa.Text(), nullable=True),
         sa.Column('tags', sa.ARRAY(sa.String()), nullable=True),
+        sa.Column('embedding', Vector(1536), nullable=True),
         sa.Column('run_count', sa.Integer(), nullable=True, server_default='0'),
         sa.Column('last_run_at', sa.DateTime(timezone=True), nullable=True),
         sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=True),
-        sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text='now()'), nullable=True),
+        sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=True),
         sa.ForeignKeyConstraint(['datasource_id'], ['datasources.id']),
         sa.PrimaryKeyConstraint('id')
     )
     op.create_index(op.f('ix_saved_sqls_id'), 'saved_sqls', ['id'], unique=False)
+    # 创建向量索引
+    op.execute('CREATE INDEX ix_saved_sqls_embedding ON saved_sqls USING ivfflat (embedding vector_cosine_ops)')
 
     # 创建导出任务表
     op.create_table(
@@ -424,11 +451,13 @@ def downgrade():
     op.drop_table('ai_configs')
     op.drop_index(op.f('ix_export_tasks_id'), table_name='export_tasks')
     op.drop_table('export_tasks')
+    op.execute('DROP INDEX IF EXISTS ix_saved_sqls_embedding')
     op.drop_index(op.f('ix_saved_sqls_id'), table_name='saved_sqls')
     op.drop_table('saved_sqls')
     op.drop_index(op.f('ix_datasources_name'), table_name='datasources')
     op.drop_index(op.f('ix_datasources_id'), table_name='datasources')
     op.drop_table('datasources')
+    op.execute('DROP EXTENSION IF EXISTS vector')
 ```
 
 - [ ] **Step 5: 提交**
@@ -1115,9 +1144,53 @@ class FormatRequest(BaseModel):
 @router.post("/format")
 async def format_sql(request: FormatRequest):
     """格式化 SQL"""
-    # TODO: 实现 SQL 格式化
-    # 可以使用 sqlparse 或 sql-formatter
-    return {"formatted_sql": request.sql}
+    import sqlparse
+    formatted = sqlparse.format(
+        request.sql,
+        reindent=True,
+        keyword_case='upper'
+    )
+    return {"formatted_sql": formatted}
+
+
+class ValidateRequest(BaseModel):
+    datasource_id: int
+    sql: str
+
+
+class ValidateResponse(BaseModel):
+    is_valid: bool
+    error: Optional[str] = None
+
+
+@router.post("/validate", response_model=ValidateResponse)
+async def validate_sql(request: ValidateRequest, db: AsyncSession = Depends(get_db)):
+    """验证 SQL 语法"""
+    # 获取数据源
+    result = await db.execute(
+        select(DatasourceModel).where(DatasourceModel.id == request.datasource_id)
+    )
+    datasource = result.scalar_one_or_none()
+    if not datasource:
+        raise HTTPException(status_code=404, detail="Datasource not found")
+
+    # 基本语法检查（根据不同数据源类型）
+    try:
+        import sqlparse
+        parsed = sqlparse.parse(request.sql)
+
+        if not parsed or not parsed[0]:
+            return ValidateResponse(is_valid=False, error="Empty SQL")
+
+        # 基本检查：是否包含 SELECT/INSERT/UPDATE/DELETE 等关键词
+        sql_upper = request.sql.upper().strip()
+        if not any(kw in sql_upper for kw in ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'DROP', 'ALTER', 'SHOW', 'DESC', 'DESCRIBE']):
+            return ValidateResponse(is_valid=False, error="No valid SQL keyword found")
+
+        return ValidateResponse(is_valid=True)
+
+    except Exception as e:
+        return ValidateResponse(is_valid=False, error=str(e))
 ```
 
 - [ ] **Step 3: 注册路由**
@@ -1171,7 +1244,9 @@ git commit -m "feat: add query execution API"
     "pinia": "^2.1.0",
     "axios": "^1.6.0",
     "element-plus": "^2.5.0",
-    "@element-plus/icons-vue": "^2.3.0"
+    "@element-plus/icons-vue": "^2.3.0",
+    "sql-formatter": "^15.0.0",
+    "vue-virtual-scroller": "^2.0.0"
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^5.0.0",
@@ -1356,7 +1431,14 @@ server {
 }
 ```
 
-- [ ] **Step 9: 提交**
+- [ ] **Step 9: 创建 frontend/.env.example**
+
+```bash
+# frontend/.env.example
+VITE_API_BASE_URL=http://localhost:8000/api/v1
+```
+
+- [ ] **Step 10: 提交**
 
 ```bash
 git add frontend/
@@ -1365,7 +1447,7 @@ git commit -m "feat: add frontend project structure"
 
 ---
 
-### Task 10: SQL 编辑器组件
+### Task 11: SQL 编辑器组件
 
 **文件:**
 - 创建: `frontend/src/components/SqlEditor.vue`
@@ -1694,7 +1776,7 @@ git commit -m "feat: add SQL editor and query page"
 
 ## 阶段 5: 导出功能
 
-### Task 11: 导出处理器实现
+### Task 12: 导出处理器实现
 
 **文件:**
 - 创建: `backend/app/services/export/csv_handler.py`
@@ -1801,7 +1883,7 @@ git commit -m "feat: add CSV and Excel export handlers"
 
 ---
 
-### Task 12: 导出 API 实现
+### Task 13: 导出 API 实现
 
 **文件:**
 - 创建: `backend/app/api/v1/exports.py`
