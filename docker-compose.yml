@@ -1,0 +1,52 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: queryexport-db
+    environment:
+      POSTGRES_USER: ${DB_USER:-queryexport}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-queryexport123}
+      POSTGRES_DB: ${DB_NAME:-queryexport}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-queryexport}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: queryexport-backend
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${DB_USER:-queryexport}:${DB_PASSWORD:-queryexport123}@postgres:5432/${DB_NAME:-queryexport}
+      - APP_SECRET_KEY=${APP_SECRET_KEY:-change-me-in-production}
+      - EXPORT_DIR=/app/exports
+    volumes:
+      - ./exports:/app/exports
+    ports:
+      - "${BACKEND_PORT:-8081}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/docs"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: queryexport-frontend
+    ports:
+      - "${FRONTEND_PORT:-21180}:80"
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
